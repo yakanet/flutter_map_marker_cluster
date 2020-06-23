@@ -2,6 +2,7 @@ import 'dart:math';
 import 'package:flutter/material.dart';
 import 'package:flutter_map/flutter_map.dart';
 import 'package:flutter_map/plugin_api.dart';
+import 'package:flutter_map_marker_cluster/src/marker_cluster_isolate.dart';
 import 'package:flutter_map_marker_popup/extension_api.dart';
 import 'package:flutter_map_marker_cluster/src/anim_type.dart';
 import 'package:flutter_map_marker_cluster/src/core/distance_grid.dart';
@@ -25,9 +26,6 @@ class MarkerClusterLayer extends StatefulWidget {
 
 class _MarkerClusterLayerState extends State<MarkerClusterLayer>
     with TickerProviderStateMixin {
-  Map<int, DistanceGrid<MarkerClusterNode>> _gridClusters = {};
-  Map<int, DistanceGrid<MarkerNode>> _gridUnclustered = {};
-  MarkerClusterNode _topClusterLevel;
   int _maxZoom;
   int _minZoom;
   int _currentZoom;
@@ -39,6 +37,8 @@ class _MarkerClusterLayerState extends State<MarkerClusterLayer>
   AnimationController _spiderfyController;
   MarkerClusterNode _spiderfyCluster;
   PolygonLayer _polygon;
+
+  Worker _worker;
 
   _MarkerClusterLayerState();
 
@@ -90,82 +90,6 @@ class _MarkerClusterLayerState extends State<MarkerClusterLayer>
       vsync: this,
       duration: widget.options.animationsOptions.spiderfy,
     );
-  }
-
-  _initializeClusters() {
-    // set up DistanceGrids for each zoom
-    for (var zoom = _maxZoom; zoom >= _minZoom; zoom--) {
-      _gridClusters[zoom] = DistanceGrid(widget.options.maxClusterRadius);
-      _gridUnclustered[zoom] = DistanceGrid(widget.options.maxClusterRadius);
-    }
-
-    _topClusterLevel = MarkerClusterNode(
-      zoom: _minZoom - 1,
-      map: widget.map,
-    );
-  }
-
-  _addLayer(MarkerNode marker) {
-    for (var zoom = _maxZoom; zoom >= _minZoom; zoom--) {
-      var markerPoint = widget.map.project(marker.point, zoom.toDouble());
-      // try find a cluster close by
-      var cluster = _gridClusters[zoom].getNearObject(markerPoint);
-      if (cluster != null) {
-        cluster.addChild(marker);
-        return;
-      }
-
-      var closest = _gridUnclustered[zoom].getNearObject(markerPoint);
-      if (closest != null) {
-        var parent = closest.parent;
-        parent.removeChild(closest);
-
-        var newCluster = MarkerClusterNode(zoom: zoom, map: widget.map)
-          ..addChild(closest)
-          ..addChild(marker);
-
-        _gridClusters[zoom].addObject(
-            newCluster, widget.map.project(newCluster.point, zoom.toDouble()));
-
-        //First create any new intermediate parent clusters that don't exist
-        var lastParent = newCluster;
-        for (var z = zoom - 1; z > parent.zoom; z--) {
-          var newParent = MarkerClusterNode(
-            zoom: z,
-            map: widget.map,
-          );
-          newParent.addChild(lastParent);
-          lastParent = newParent;
-          _gridClusters[z].addObject(
-              lastParent, widget.map.project(closest.point, z.toDouble()));
-        }
-        parent.addChild(lastParent);
-
-        _removeFromNewPosToMyPosGridUnclustered(closest, zoom);
-        return;
-      }
-
-      _gridUnclustered[zoom].addObject(marker, markerPoint);
-    }
-
-    //Didn't get in anything, add us to the top
-    _topClusterLevel.addChild(marker);
-  }
-
-  _addLayers() {
-    for (var marker in widget.options.markers) {
-      _addLayer(MarkerNode(marker));
-    }
-
-    _topClusterLevel.recalculateBounds();
-  }
-
-  _removeFromNewPosToMyPosGridUnclustered(MarkerNode marker, int zoom) {
-    for (; zoom >= _minZoom; zoom--) {
-      if (!_gridUnclustered[zoom].removeObject(marker)) {
-        break;
-      }
-    }
   }
 
   Animation<double> _fadeAnimation(
@@ -510,7 +434,7 @@ class _MarkerClusterLayerState extends State<MarkerClusterLayer>
     return layers;
   }
 
-  List<Widget> _buildLayers() {
+  List<Widget> _buildLayers(MarkerClusterNode topClusterLevel) {
     if (widget.map.zoom != _previousZoomDouble) {
       _previousZoomDouble = widget.map.zoom;
 
@@ -534,7 +458,7 @@ class _MarkerClusterLayerState extends State<MarkerClusterLayer>
             })); // for remove previous layer (animation)
     }
 
-    _topClusterLevel.recursively(_currentZoom, (layer) {
+    topClusterLevel.recursively(_currentZoom, (layer) {
       layers.addAll(_buildLayer(layer));
     });
 
@@ -716,8 +640,14 @@ class _MarkerClusterLayerState extends State<MarkerClusterLayer>
     _maxZoom = widget.map.options.maxZoom?.floor() ?? 20;
 
     _initializeAnimationController();
-    _initializeClusters();
-    _addLayers();
+    _worker = Worker();
+    _worker.recalculate(RecalculateOptions(
+      markers: widget.options.markers,
+      maxClusterRadius: widget.options.maxClusterRadius,
+      zoom: widget.map.zoom,
+      maxZoom: _maxZoom,
+      minZoom: _minZoom,
+    ));
 
     _zoomController.forward();
 
@@ -736,8 +666,13 @@ class _MarkerClusterLayerState extends State<MarkerClusterLayer>
   @override
   void didUpdateWidget(MarkerClusterLayer oldWidget) {
     if (oldWidget.options.markers != widget.options.markers) {
-      _initializeClusters();
-      _addLayers();
+      _worker.recalculate(RecalculateOptions(
+        markers: widget.options.markers,
+        maxClusterRadius: widget.options.maxClusterRadius,
+        zoom: widget.map.zoom,
+        maxZoom: _maxZoom,
+        minZoom: _minZoom,
+      ));
     }
     super.didUpdateWidget(oldWidget);
   }
@@ -747,10 +682,18 @@ class _MarkerClusterLayerState extends State<MarkerClusterLayer>
     return StreamBuilder<void>(
       stream: widget.stream, // a Stream<void> or null
       builder: (BuildContext context, _) {
-        return Container(
-          child: Stack(
-            children: _buildLayers(),
-          ),
+        return StreamBuilder<MarkerClusterNode>(
+          stream: _worker.stream,
+          builder: (context, snapshot) {
+            if (!snapshot.hasData) {
+              return Container();
+            }
+            return Container(
+              child: Stack(
+                children: _buildLayers(snapshot.data),
+              ),
+            );
+          },
         );
       },
     );
